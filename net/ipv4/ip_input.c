@@ -146,6 +146,27 @@
 #include <linux/netlink.h>
 
 /*
+ * ip_rcv
+ * │
+ * └──►NF_INET_PRE_ROUTING
+ *     ▼
+ *     ip_rcv_finish
+ *     │
+ *     └──►ip_route_input_noref
+ *         ▼
+ *         dst_input(local/forward)
+ *         ip_local_deliver
+ *         │
+ *         └──►NF_INET_LOCAL_IN
+ *             ▼
+ *             ip_local_deliver_finish
+ *             │
+ *             └──►raw_local_deliver
+ *                 ▼
+ *                 handler(tcp/udp...)
+ */
+
+/*
  *	Process Router Attention IP option (RFC 2113)
  */
 int ip_call_ra_chain(struct sk_buff *skb)
@@ -185,13 +206,21 @@ int ip_call_ra_chain(struct sk_buff *skb)
 	return 0;
 }
 
+/* 将数据包上送到传输层。
+ */
 static int ip_local_deliver_finish(struct sk_buff *skb)
 {
 	struct net *net = dev_net(skb->dev);
 
+	/* include/linux/skbuff.h:1185
+	 * 移动skb->data，指向传输层位置。
+	 */
 	__skb_pull(skb, ip_hdrlen(skb));
 
-	/* Point into the IP datagram, just past the header. */
+	/* Point into the IP datagram, just past the header.
+	 * include/linux/skbuff.h:1264
+	 * 更新skb->transport_header
+	 */
 	skb_reset_transport_header(skb);
 
 	rcu_read_lock();
@@ -201,9 +230,15 @@ static int ip_local_deliver_finish(struct sk_buff *skb)
 		const struct net_protocol *ipprot;
 
 	resubmit:
+		/* 先看一下该数据包是否是RAW，如果是，就按raw进行处理。
+		 */
 		raw = raw_local_deliver(skb, protocol);
 
 		hash = protocol & (MAX_INET_PROTOS - 1);
+		/* inet_protos中就是基于IP的各种协议集合，协议号就是 inet_protos 的下标。
+		 * 如果找到了，就执行对应的处理函数。
+		 * 如果没找到，还要检查一下是否为 raw_socket
+		 */
 		ipprot = rcu_dereference(inet_protos[hash]);
 		if (ipprot != NULL) {
 			int ret;
@@ -223,6 +258,8 @@ static int ip_local_deliver_finish(struct sk_buff *skb)
 				}
 				nf_reset(skb);
 			}
+			/* 调用对应协议的处理函数。
+			 */
 			ret = ipprot->handler(skb);
 			if (ret < 0) {
 				protocol = -ret;
@@ -231,6 +268,8 @@ static int ip_local_deliver_finish(struct sk_buff *skb)
 			IP_INC_STATS_BH(net, IPSTATS_MIB_INDELIVERS);
 		} else {
 			if (!raw) {
+				/* RAW 套接口没有接收或接收异常，则还需产生一个目的不可达 ICMP 报文给发送方。
+				 */
 				if (xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb)) {
 					IP_INC_STATS_BH(net, IPSTATS_MIB_INUNKNOWNPROTOS);
 					icmp_send(skb, ICMP_DEST_UNREACH,
@@ -249,11 +288,16 @@ static int ip_local_deliver_finish(struct sk_buff *skb)
 
 /*
  * 	Deliver IP Packets to the higher protocol layers.
+ * 该函数的主要流程为：
+ * 	分片重组
+ * 	经过 "NF_INET_LOCAL_IN"，
+ * 	调用 ip_local_deliver_finish，进入传输层处理函数。
  */
 int ip_local_deliver(struct sk_buff *skb)
 {
 	/*
 	 *	Reassemble IP fragments.
+	 *  首先判断该数据包是否进行了分片，分片需要等待所有分片到达，然后重组。
 	 */
 
 	if (ip_hdr(skb)->frag_off & htons(IP_MF | IP_OFFSET)) {
@@ -314,9 +358,15 @@ drop:
 	return -1;
 }
 
+/* 此函数的主要功能有：
+ * 	查找路由
+ * 	处理IP可选字段
+ * 	根据路由查找结果，到本地调用 ip_local_deliver，需要转发调用 ip_forward
+ */
 static int ip_rcv_finish(struct sk_buff *skb)
 {
 	const struct iphdr *iph = ip_hdr(skb);
+	/* rtable 是路由表的一条表项 */
 	struct rtable *rt;
 
 	/*
@@ -324,6 +374,9 @@ static int ip_rcv_finish(struct sk_buff *skb)
 	 *	how the packet travels inside Linux networking.
 	 */
 	if (skb_dst(skb) == NULL) {
+		/* include/net/route.h:123
+		 * 该函数进行路由查找，路由结果可通过 skb_dst(skb) 获得。
+		 */
 		int err = ip_route_input_noref(skb, iph->daddr, iph->saddr,
 					       iph->tos, skb->dev);
 		if (unlikely(err)) {
@@ -351,6 +404,8 @@ static int ip_rcv_finish(struct sk_buff *skb)
 	}
 #endif
 
+	/* 检查是否有可选字段，有的话就调用 ip_rcv_options 进行处理。
+	 */
 	if (iph->ihl > 5 && ip_rcv_options(skb))
 		goto drop;
 
@@ -362,6 +417,8 @@ static int ip_rcv_finish(struct sk_buff *skb)
 		IP_UPD_PO_STATS_BH(dev_net(rt->dst.dev), IPSTATS_MIB_INBCAST,
 				skb->len);
 
+	/* 根据路由查找结果，到本地调用 ip_local_deliver，需要转发调用 ip_forward
+	 */
 	return dst_input(skb);
 
 drop:
@@ -371,6 +428,16 @@ drop:
 
 /*
  * 	Main IP Receive routine.
+ *
+ * IP层的入口函数
+ * @skb: 接收到的IP数据包
+ * @dev: 接收到的IP数据包当前的输入网络设备
+ * @pt: 输入此数据包的网络层输入接口
+ * @orig_dev: 接收到的IP数据包原始的输入网络设备
+ *
+ * 此函数主要做合法性检查，不合法直接丢弃，合法才进入后续流程：
+ * 	"NF_INET_PRE_ROUTING"，
+ * 	ip_rcv_finish
  */
 int ip_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt, struct net_device *orig_dev)
 {
@@ -379,6 +446,10 @@ int ip_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt, 
 
 	/* When the interface is in promisc. mode, drop all the crap
 	 * that it receives, do not try to analyse it.
+	 * 混杂模式(promiscuous mode) 指一台机器的网卡能够接收所有经过它的数据流，而不论其目的地址是否是它。
+	 * 一般计算机网卡都工作在非混杂模式下，此时网卡只接受来自网络端口的目的地址指向自己的数据。
+	 *
+	 * 这里就是在非混杂模式下，若数据包目的MAC地址不是当前主机，就应该丢掉。
 	 */
 	if (skb->pkt_type == PACKET_OTHERHOST)
 		goto drop;
@@ -386,14 +457,25 @@ int ip_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt, 
 
 	IP_UPD_PO_STATS_BH(dev_net(dev), IPSTATS_MIB_IN, skb->len);
 
+	/* include/linux/skbuff.h:750
+	 * 检测skb是否是共享的，就clone一份独享的返回，因为后续可能会修改它！
+	 */
 	if ((skb = skb_share_check(skb, GFP_ATOMIC)) == NULL) {
 		IP_INC_STATS_BH(dev_net(dev), IPSTATS_MIB_INDISCARDS);
 		goto out;
 	}
 
+	/* include/linux/skbuff.h:1213
+	 * iphdr的长度为20字节，这里 may_pull 就是判断一下skb->len(也就是data）的长度是否超过20字节，
+	 * 正常数据包肯定是大于20的，如果小于肯定是损坏的数据包，直接丢弃。
+	 * 这里并没有移动skb中data指针的位置。
+	 */
 	if (!pskb_may_pull(skb, sizeof(struct iphdr)))
 		goto inhdr_error;
 
+	/* include/linux/ip.h:110
+	 * 返回skb的网络层地址
+	 */
 	iph = ip_hdr(skb);
 
 	/*
@@ -410,14 +492,22 @@ int ip_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt, 
 	if (iph->ihl < 5 || iph->version != 4)
 		goto inhdr_error;
 
+	/* IPheader的长度可变（options），这里再检测一下skb的长度是否小于IPheader的长度。
+	 */
 	if (!pskb_may_pull(skb, iph->ihl*4))
 		goto inhdr_error;
 
 	iph = ip_hdr(skb);
 
+	/* 根据校验和判断IPheader是否合法
+	 */
 	if (unlikely(ip_fast_csum((u8 *)iph, iph->ihl)))
 		goto inhdr_error;
 
+	/* 获取IPheader中的长度信息，包括payload。
+	 * 如果收到的数据包的实际长度skb->len 小于其预期长度iph->tot_len，说明数据包受损，丢弃。
+	 * 如果预期长度小于ipheader的最小长度，说明header里的信息错误。
+	 */
 	len = ntohs(iph->tot_len);
 	if (skb->len < len) {
 		IP_INC_STATS_BH(dev_net(dev), IPSTATS_MIB_INTRUNCATEDPKTS);
@@ -428,18 +518,26 @@ int ip_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt, 
 	/* Our transport medium may have padded the buffer out. Now we know it
 	 * is IP we can trim to the true length of the frame.
 	 * Note this now means skb->len holds ntohs(iph->tot_len).
+	 * 当数据包总长度不足64时，会在末尾填充一些值，到最小长度64位，但IP header中的
+	 * 总长度字段并还是有效数据的长度。这里就将skb->len缩小到iph->tot_len的大小。
 	 */
 	if (pskb_trim_rcsum(skb, len)) {
 		IP_INC_STATS_BH(dev_net(dev), IPSTATS_MIB_INDISCARDS);
 		goto drop;
 	}
 
-	/* Remove any debris in the socket control block */
+	/* Remove any debris in the socket control block
+	 * 将 skb 中的IP控制块清零，以便后续对IP选项的处理
+	 */
 	memset(IPCB(skb), 0, sizeof(struct inet_skb_parm));
 
-	/* Must drop socket now because of tproxy. */
+	/* Must drop socket now because of tproxy.
+	 * include/linux/skbuff.h:1485
+	 */
 	skb_orphan(skb);
 
+	/* 最后通过 netfilter 模块处理后，调用 ip_rcv_finish 完成IP数据报的输入。
+	 */
 	return NF_HOOK(NFPROTO_IPV4, NF_INET_PRE_ROUTING, skb, dev, NULL,
 		       ip_rcv_finish);
 
