@@ -83,6 +83,25 @@
 
 int sysctl_ip_default_ttl __read_mostly = IPDEFTTL;
 
+/**
+ * 此文件包含数据包从传输层传递下来后，IP层相关的输出函数。
+ * 也有可能是经过ip_forward转发后，调用输出函数。
+ *
+ * 转发流程：
+ *
+ * ip_output
+ * │
+ * └──►NF_INET_POST_ROUTING
+ *     ▼
+ *     ip_finish_output
+ *     │
+ *     └──►ip_fragment
+ *         ip_finish_output2
+ *         │
+ *         └──►neigh_hh_output
+ *             dst->neighbour->output
+ */
+
 /* Generate a checksum for an outgoing IP datagram. */
 __inline__ void ip_send_check(struct iphdr *iph)
 {
@@ -175,6 +194,10 @@ int ip_build_and_send_pkt(struct sk_buff *skb, struct sock *sk,
 }
 EXPORT_SYMBOL_GPL(ip_build_and_send_pkt);
 
+/**
+ * 此函数通过邻居子系统将数据包输出到网络设备。
+ * 邻居子系统用于根据目的IP获取对应的目的MAC地址。
+ */
 static inline int ip_finish_output2(struct sk_buff *skb)
 {
 	struct dst_entry *dst = skb_dst(skb);
@@ -187,7 +210,10 @@ static inline int ip_finish_output2(struct sk_buff *skb)
 	} else if (rt->rt_type == RTN_BROADCAST)
 		IP_UPD_PO_STATS(dev_net(dev), IPSTATS_MIB_OUTBCAST, skb->len);
 
-	/* Be paranoid, rather than too clever. */
+	/* Be paranoid, rather than too clever.
+	 * 检测 skb 的前部空间是否还能存储链路层首部。如果不够，则重新分配更大存
+	 * 储区的 SKB，并释放原 skb 。
+	 */
 	if (unlikely(skb_headroom(skb) < hh_len && dev->header_ops)) {
 		struct sk_buff *skb2;
 
@@ -202,11 +228,15 @@ static inline int ip_finish_output2(struct sk_buff *skb)
 		skb = skb2;
 	}
 
+	/* 如果缓存了链路层的首部，则调用 neigh_hh_output()输出数据报。
+	 * 否则，若存在对应的邻居项，则通过邻居项的输出方法输出数据报。
+	 */
 	if (dst->hh)
 		return neigh_hh_output(dst->hh, skb);
 	else if (dst->neighbour)
 		return dst->neighbour->output(skb);
 
+	/* 这里就是异常情况了，不能输出数据包 */
 	if (net_ratelimit())
 		printk(KERN_DEBUG "ip_finish_output2: No header cache and no neighbour!\n");
 	kfree_skb(skb);
@@ -221,6 +251,9 @@ static inline int ip_skb_dst_mtu(struct sk_buff *skb)
 	       skb_dst(skb)->dev->mtu : dst_mtu(skb_dst(skb));
 }
 
+/**
+ * 经过 netfilter 后的输出处理函数
+ */
 static int ip_finish_output(struct sk_buff *skb)
 {
 #if defined(CONFIG_NETFILTER) && defined(CONFIG_XFRM)
@@ -230,12 +263,18 @@ static int ip_finish_output(struct sk_buff *skb)
 		return dst_output(skb);
 	}
 #endif
+	/* 若数据包大小超过了最小路径MTU(pmtu)，就需要分片。
+	 * 如果数据包支持GSO的话，就交给网卡进行分片。
+	 */
 	if (skb->len > ip_skb_dst_mtu(skb) && !skb_is_gso(skb))
 		return ip_fragment(skb, ip_finish_output2);
 	else
 		return ip_finish_output2(skb);
 }
 
+/**
+ * 将数据包输出到网络设备接口，针对组播的数据包。
+ */
 int ip_mc_output(struct sk_buff *skb)
 {
 	struct sock *sk = skb->sk;
@@ -297,6 +336,11 @@ int ip_mc_output(struct sk_buff *skb)
 			    !(IPCB(skb)->flags & IPSKB_REROUTED));
 }
 
+/**
+ * 将数据包输出到网络设备接口，针对单播的数据包。
+ * 	NF_INET_POST_ROUTING
+ * 	ip_finish_output
+ */
 int ip_output(struct sk_buff *skb)
 {
 	struct net_device *dev = skb_dst(skb)->dev;
@@ -306,6 +350,7 @@ int ip_output(struct sk_buff *skb)
 	skb->dev = dev;
 	skb->protocol = htons(ETH_P_IP);
 
+	/* 经过 NF_INET_POST_ROUTING，然后调用ip_finish_output。 */
 	return NF_HOOK_COND(NFPROTO_IPV4, NF_INET_POST_ROUTING, skb, NULL, dev,
 			    ip_finish_output,
 			    !(IPCB(skb)->flags & IPSKB_REROUTED));
