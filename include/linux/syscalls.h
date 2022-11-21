@@ -188,6 +188,7 @@ extern struct trace_event_functions exit_syscall_print_funcs;
 #define SYSCALL_DEFINE0(name)	   asmlinkage long sys_##name(void)
 #endif
 
+/* 这里的序号1，2，3，4只是表示该宏定义除name以外的参数的个数 */
 #define SYSCALL_DEFINE1(name, ...) SYSCALL_DEFINEx(1, _##name, __VA_ARGS__)
 #define SYSCALL_DEFINE2(name, ...) SYSCALL_DEFINEx(2, _##name, __VA_ARGS__)
 #define SYSCALL_DEFINE3(name, ...) SYSCALL_DEFINEx(3, _##name, __VA_ARGS__)

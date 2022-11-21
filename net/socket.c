@@ -392,6 +392,17 @@ static int sock_alloc_file(struct socket *sock, struct file **f, int flags)
 	return fd;
 }
 
+/**
+ * fd 是进程中一个文件指针数组files->fd_array[fd]的下标，include/linux/sched.h:1319
+ *
+ * 从传入参数 sock 可以得到对应文件的 inode（看前面socket_create过程），
+ * 此函数创建一个file对象 newfile，指向sock对应的inode，再通过
+ *	sock->file = newfile;
+ *	newfile->private_data = sock;
+ * 就将newfile与sock对应起来了；
+ *
+ * 再通过fd_install将 fd 与 newfile 对应起来，就相当于将fd 与 sock 绑定起来了。
+ */
 int sock_map_fd(struct socket *sock, int flags)
 {
 	struct file *newfile;
@@ -466,6 +477,12 @@ static struct socket *sockfd_lookup_light(int fd, int *err, int *fput_needed)
  *	Allocate a new inode and socket object. The two are bound together
  *	and initialised. The socket is then returned. If we are out of inodes
  *	NULL is returned.
+ *
+ *	socket 和 inode 是一起分配内存空间的，而且是连续的。
+ *	struct socket_alloc {
+ *		struct socket socket;
+ *		struct inode vfs_inode;
+ *	};
  */
 
 static struct socket *sock_alloc(void)
@@ -473,10 +490,12 @@ static struct socket *sock_alloc(void)
 	struct inode *inode;
 	struct socket *sock;
 
+	/* 为socket和inode分配空间，并返回 inode 的地址 */
 	inode = new_inode(sock_mnt->mnt_sb);
 	if (!inode)
 		return NULL;
 
+	/* 基于inode的地址，通过 container_of 获取socket的地址 */
 	sock = SOCKET_I(inode);
 
 	kmemcheck_annotate_bitfield(sock, type);
@@ -1144,6 +1163,9 @@ call_kill:
 }
 EXPORT_SYMBOL(sock_wake_async);
 
+/**
+ * @kern: 标识由应用程序还是内核创建该套接口。
+ */
 static int __sock_create(struct net *net, int family, int type, int protocol,
 			 struct socket **res, int kern)
 {
@@ -1174,6 +1196,7 @@ static int __sock_create(struct net *net, int family, int type, int protocol,
 		family = PF_PACKET;
 	}
 
+	/* 安全模块对套接口的创建做检查 */
 	err = security_socket_create(family, type, protocol, kern);
 	if (err)
 		return err;
@@ -1182,6 +1205,10 @@ static int __sock_create(struct net *net, int family, int type, int protocol,
 	 *	Allocate the socket and allow the family to set things up. if
 	 *	the protocol is 0, the family is instructed to select an appropriate
 	 *	default.
+	 * 调用 sock_alloc 在 sock_inode_cache 缓存中分配与套接口关联的i 结点和套
+	 * 接口，同时初始化 i 结点和套接口，分配失败则直接返回错误码。之所以套接口也可以像一般
+	 * 的文件对它进行读写，是由于在创建套接口的同时还需要创建与它相关联的文件，此 i 结点就
+	 * 用来标识此文件的。
 	 */
 	sock = sock_alloc();
 	if (!sock) {
@@ -1220,6 +1247,11 @@ static int __sock_create(struct net *net, int family, int type, int protocol,
 	/* Now protected by module ref count */
 	rcu_read_unlock();
 
+	/*
+	 * net/ipv4/af_inet.c:266
+	 * 在 IPv4 协议族中调用 inet_create 对已创建的套接口继续进行初始化，
+	 * 同时创建传输控制块 struct sock，以及对sock的初始化。
+	 */
 	err = pf->create(net, sock, protocol, kern);
 	if (err < 0)
 		goto out_module_put;
@@ -1236,6 +1268,7 @@ static int __sock_create(struct net *net, int family, int type, int protocol,
 	 * module can have its refcnt decremented
 	 */
 	module_put(pf->owner);
+	/* 安全模块对套接口的创建做检查 */
 	err = security_socket_post_create(sock, family, type, protocol, kern);
 	if (err)
 		goto out_sock_release;
@@ -1257,6 +1290,13 @@ out_release:
 	goto out_sock_release;
 }
 
+/**
+ * 根据指定的协议族、类型、协议创建套接字。
+ * @family: 待创建套接口的协议族，如 PF_INET、PF_UNIX 等。
+ * @type: 待创建套接口的类型，如 SOCK_STREAM、SOCK _DGRAM、SOCK_RAW 等。
+ * @protocol: 传输层协议，如 IPPROTO_TCP、IPPROTO_UDP 等。
+ * @res: 传出参数，指向新创建的套接字。
+ */
 int sock_create(int family, int type, int protocol, struct socket **res)
 {
 	return __sock_create(current->nsproxy->net_ns, family, type, protocol, res, 0);
@@ -1269,6 +1309,12 @@ int sock_create_kern(int family, int type, int protocol, struct socket **res)
 }
 EXPORT_SYMBOL(sock_create_kern);
 
+/**
+ * sys_socket	创建套接口，以及与此套接口关联的文件inode，绑定文件描述符。
+ * @family:	待创建套接口的协议族，如 PF_INET、PF_UNIX 等。
+ * @type:	待创建套接口的类型，如 SOCK_STREAM、SOCK _DGRAM、SOCK_RAW 等。
+ * @protocol:	传输层协议，如 IPPROTO_TCP、IPPROTO_UDP 等。
+ */
 SYSCALL_DEFINE3(socket, int, family, int, type, int, protocol)
 {
 	int retval;
@@ -1289,10 +1335,12 @@ SYSCALL_DEFINE3(socket, int, family, int, type, int, protocol)
 	if (SOCK_NONBLOCK != O_NONBLOCK && (flags & SOCK_NONBLOCK))
 		flags = (flags & ~SOCK_NONBLOCK) | O_NONBLOCK;
 
+	/* 创建套接字 */
 	retval = sock_create(family, type, protocol, &sock);
 	if (retval < 0)
 		goto out;
 
+	/* 给创建的套接口分配一个文件描述符并绑定 */
 	retval = sock_map_fd(sock, flags & (O_CLOEXEC | O_NONBLOCK));
 	if (retval < 0)
 		goto out_release;
@@ -1390,6 +1438,12 @@ out:
  *	We move the socket address to kernel space before we call
  *	the protocol layer (having also checked the address is ok).
  */
+/**
+ * sys_bind	将一个本地的地址及传输层的端口和套接口关联起来。
+ * @fd:		创建socket时返回的文件描述符。
+ * @umyaddr:	地址信息，包括IP地址和端口号，占用的内存是在用户空间。
+ * @addrlen:	地址长度。
+ */
 
 SYSCALL_DEFINE3(bind, int, fd, struct sockaddr __user *, umyaddr, int, addrlen)
 {
@@ -1397,18 +1451,26 @@ SYSCALL_DEFINE3(bind, int, fd, struct sockaddr __user *, umyaddr, int, addrlen)
 	struct sockaddr_storage address;
 	int err, fput_needed;
 
+	/* 根据文件描述符获取套接口指针，并且返回是否需要减少对文件引用计数的标志 */
 	sock = sockfd_lookup_light(fd, &err, &fput_needed);
 	if (sock) {
+		/* 将地址信息从用户空间复制到内核空间 */
 		err = move_addr_to_kernel(umyaddr, addrlen, (struct sockaddr *)&address);
 		if (err >= 0) {
+			/* 安全模块对套接口 bind 做检查 */
 			err = security_socket_bind(sock,
 						   (struct sockaddr *)&address,
 						   addrlen);
 			if (!err)
+				/*
+				 * net/ipv4/af_inet.c:451
+				 * 通过套接口层接口，调用bind接口，IPv4为inet_bind
+				 */
 				err = sock->ops->bind(sock,
 						      (struct sockaddr *)
 						      &address, addrlen);
 		}
+		/* 需要根据fput_needed标志，减少对文件的引用计数 */
 		fput_light(sock->file, fput_needed);
 	}
 	return err;
@@ -1419,6 +1481,12 @@ SYSCALL_DEFINE3(bind, int, fd, struct sockaddr __user *, umyaddr, int, addrlen)
  *	necessary for a listen, and if that works, we mark the socket as
  *	ready for listening.
  */
+/**
+ * sys_listen	通知进程准备接受套接口上的连接请求，同时也可指定套接口上可以等待
+ *		连接的等待队列的长度。
+ * @fd:		创建socket时返回的文件描述符。
+ * @backlog:	为指定连接队列长度的最大值。
+ */
 
 SYSCALL_DEFINE2(listen, int, fd, int, backlog)
 {
@@ -1426,14 +1494,20 @@ SYSCALL_DEFINE2(listen, int, fd, int, backlog)
 	int err, fput_needed;
 	int somaxconn;
 
+	/* 根据文件描述符获取套接口指针，并且返回是否需要减少对文件引用计数的标志 */
 	sock = sockfd_lookup_light(fd, &err, &fput_needed);
 	if (sock) {
+		/* 对参数门限值做校验，门限值不能超过上限 */
 		somaxconn = sock_net(sock->sk)->core.sysctl_somaxconn;
 		if ((unsigned)backlog > somaxconn)
 			backlog = somaxconn;
 
 		err = security_socket_listen(sock, backlog);
 		if (!err)
+			/* net/ipv4/af_inet.c:192
+			 * 通过套接口系统调用的跳转表 proto_ops 结构，
+			 * 调用对应传输协议中的 listen 操作，tcp中为 inet_listen。
+			 */
 			err = sock->ops->listen(sock, backlog);
 
 		fput_light(sock->file, fput_needed);
@@ -1451,6 +1525,13 @@ SYSCALL_DEFINE2(listen, int, fd, int, backlog)
  *	1003.1g adds the ability to recvmsg() to query connection pending
  *	status to recvmsg. We need to add that support in a way thats
  *	clean when we restucture accept also.
+ */
+/**
+ * sys_accept	返回一个新的文件描述符，指向一个新创建的连接到客户端的套接口文件，
+ *		用于监听的套接字仍然是未连接的。
+ * @fd:		创建socket时返回的文件描述符。
+ * @upeer_sockaddr:	传出参数，写入新连接的客户端的地址，地址在用户空间。
+ * @upeer_addrlen:	传出参数，写入新连接的客户端的地址长度。
  */
 
 SYSCALL_DEFINE4(accept4, int, fd, struct sockaddr __user *, upeer_sockaddr,
@@ -1485,6 +1566,7 @@ SYSCALL_DEFINE4(accept4, int, fd, struct sockaddr __user *, upeer_sockaddr,
 	 */
 	__module_get(newsock->ops->owner);
 
+	/* 给套接口 newsock 分配文件描述符，并且跟套接口绑定 */
 	newfd = sock_alloc_file(newsock, &newfile, flags);
 	if (unlikely(newfd < 0)) {
 		err = newfd;
@@ -1496,16 +1578,22 @@ SYSCALL_DEFINE4(accept4, int, fd, struct sockaddr __user *, upeer_sockaddr,
 	if (err)
 		goto out_fd;
 
+	/*
+	 * net/ipv4/inet_connection_sock.c:267
+	 * TCP 中实现的函数为 inet_csk_accept()
+	 */
 	err = sock->ops->accept(sock, newsock, sock->file->f_flags);
 	if (err < 0)
 		goto out_fd;
 
+	/* 如果需要客户端的地址信息，则调用对应传输协议中的 getname */
 	if (upeer_sockaddr) {
 		if (newsock->ops->getname(newsock, (struct sockaddr *)&address,
 					  &len, 2) < 0) {
 			err = -ECONNABORTED;
 			goto out_fd;
 		}
+		/* 将获取的地址信息复制到用户空间 */
 		err = move_addr_to_user((struct sockaddr *)&address,
 					len, upeer_sockaddr, upeer_addrlen);
 		if (err < 0)
@@ -1514,6 +1602,7 @@ SYSCALL_DEFINE4(accept4, int, fd, struct sockaddr __user *, upeer_sockaddr,
 
 	/* File flags are not inherited via accept() unlike another OSes. */
 
+	/* 添加新的文件描述符到进程的文件列表 */
 	fd_install(newfd, newfile);
 	err = newfd;
 

@@ -458,6 +458,11 @@ int inet_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	int err;
 
 	/* If the socket has its own bind function then use it. (RAW) */
+	/*
+	 * 如果当前套接口在传输层接口上有 bind 的实现，则直接调用传输层接口上的
+	 * bind()，直接进行 bind 操作即可，和否则进行下面的操作。
+	 * 目前只有 SOCK_RAW 类型的套接口的传输层接口实现了bind接口，为raw_bind()。
+	 */
 	if (sk->sk_prot->bind) {
 		err = sk->sk_prot->bind(sk, uaddr, addr_len);
 		goto out;
@@ -466,6 +471,7 @@ int inet_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	if (addr_len < sizeof(struct sockaddr_in))
 		goto out;
 
+	/* 得到地址的类型：广播、多播、单播 */
 	chk_addr_ret = inet_addr_type(sock_net(sk), addr->sin_addr.s_addr);
 
 	/* Not specified by any standard per-se, however it breaks too
@@ -475,6 +481,7 @@ int inet_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	 * (ie. your servers still start up even if your ISDN link
 	 *  is temporarily down)
 	 */
+	/* 根据系统参数结合获取到的地址类型进行校验，以便决定是否可以进行地址和端口的绑定 */
 	err = -EADDRNOTAVAIL;
 	if (!sysctl_ip_nonlocal_bind &&
 	    !(inet->freebind || inet->transparent) &&
@@ -484,6 +491,7 @@ int inet_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	    chk_addr_ret != RTN_BROADCAST)
 		goto out;
 
+	/* 对待绑定的端口进行合法性校验，并判断是否允许绑定小于1024的特权端口 */
 	snum = ntohs(addr->sin_port);
 	err = -EACCES;
 	if (snum && snum < PROT_SOCK && !capable(CAP_NET_BIND_SERVICE))
@@ -499,15 +507,19 @@ int inet_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	lock_sock(sk);
 
 	/* Check these errors (active socket, double bind). */
+	/* 对传输控制块的状态进行检查，UDP的传输控制块也用TCP_CLOSE标识关闭标志 */
 	err = -EINVAL;
 	if (sk->sk_state != TCP_CLOSE || inet->inet_num)
 		goto out_release_sock;
 
+	/* 绑定IP地址到传输控制块中 */
 	inet->inet_rcv_saddr = inet->inet_saddr = addr->sin_addr.s_addr;
 	if (chk_addr_ret == RTN_MULTICAST || chk_addr_ret == RTN_BROADCAST)
 		inet->inet_saddr = 0;  /* Use device */
 
 	/* Make sure we are allowed to bind here. */
+	/* 调用传输层接口上的 get_port，进行具体传输层的端口绑定
+	 * tcp为 tcp_v4_get_port, udp为 udp_v4_get_port */
 	if (sk->sk_prot->get_port(sk, snum)) {
 		inet->inet_saddr = inet->inet_rcv_saddr = 0;
 		err = -EADDRINUSE;
@@ -521,6 +533,7 @@ int inet_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	inet->inet_sport = htons(inet->inet_num);
 	inet->inet_daddr = 0;
 	inet->inet_dport = 0;
+	/* 由于重新进行了绑定，因此需要清除此传输控制块的路由缓存项 */
 	sk_dst_reset(sk);
 	err = 0;
 out_release_sock:
