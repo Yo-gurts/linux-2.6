@@ -191,6 +191,9 @@ static int udp_lib_lport_inuse2(struct net *net, __u16 num,
  *  @saddr_comp:  AF-dependent comparison of bound local IP addresses
  *  @hash2_nulladdr: AF-dependant hash value in secondary hash chains,
  *                   with NULL address
+ * 传输层绑定端口的函数，如果指定了端口 snum，只需要检查snum是否被占用。
+ * 如果未指定，则需要自动分配一个，选择合适的端口是为了使 UDP 传输控制块在
+ * udp_hash 散列表中的分布比较均匀，因此选择算法不是简单地递增。
  */
 int udp_lib_get_port(struct sock *sk, unsigned short snum,
 		       int (*saddr_comp)(const struct sock *sk1,
@@ -1291,6 +1294,9 @@ static int __udp_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
  *
  * Note that in the success and error cases, the skb is assumed to
  * have either been requeued or freed.
+ *
+ * 将 UDP 数据报添加到所属传输控制块的接收队列中。在添加之前必须先进行数据报
+ * 类型检测，因为不同类型数据报，各自的接收处理方式不尽相同。
  */
 int udp_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 {
@@ -1303,9 +1309,11 @@ int udp_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 	 */
 	if (!xfrm4_policy_check(sk, XFRM_POLICY_IN, skb))
 		goto drop;
+	/* 复位接收到的 SKB 中与 netfilter 相关的数据 */
 	nf_reset(skb);
 
 	if (up->encap_type) {
+		/* 如果输入的是一个通过 IPSEC 协议封装的报文 */
 		/*
 		 * This is an encapsulation socket so pass the skb to
 		 * the socket's udp_encap_rcv() hook. Otherwise, just
@@ -1336,6 +1344,7 @@ int udp_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 
 	/*
 	 * 	UDP-Lite specific tests, ignored on UDP sockets
+	 * 如果接收的是轻量级 UDP 数据报，则校验该数据报需校验的字节是否有效。
 	 */
 	if ((is_udplite & UDPLITE_RECV_CC)  &&  UDP_SKB_CB(skb)->partial_cov) {
 
@@ -1370,17 +1379,21 @@ int udp_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 		}
 	}
 
+	/* 如果安装了套接口过滤器且报文需校验，则检测UDP数据报校验和，失败丢弃 */
 	if (sk->sk_filter) {
 		if (udp_lib_checksum_complete(skb))
 			goto drop;
 	}
 
 
+	/* 如果接收队列已经满了，不能再添加数据包，直接丢弃 */
 	if (sk_rcvqueues_full(sk, skb))
 		goto drop;
 
 	rc = 0;
 
+	/* 若sk被其他线程占用，就调用 sk_add_backlog
+	 * 否则调用 __udp_queue_rcv_skb 将数据包放入sk的接收队列 */
 	bh_lock_sock(sk);
 	if (!sock_owned_by_user(sk))
 		rc = __udp_queue_rcv_skb(sk, skb);
@@ -1519,6 +1532,8 @@ static inline int udp4_csum_init(struct sk_buff *skb, struct udphdr *uh,
 
 /*
  *	All we need to do is get the socket, and then do a checksum.
+ *	对数据包进行校验，根据源目的地址信息查找对应的传输控制块，然后将数据包
+ *	插入sk的接收队列。
  */
 
 int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
@@ -1534,6 +1549,7 @@ int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
 	/*
 	 *  Validate the packet.
 	 */
+	/* 检测SKB中的数据是否有指定的长度 */
 	if (!pskb_may_pull(skb, sizeof(struct udphdr)))
 		goto drop;		/* No space for header. */
 
@@ -1542,6 +1558,8 @@ int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
 	saddr = ip_hdr(skb)->saddr;
 	daddr = ip_hdr(skb)->daddr;
 
+	/* 如果UDP首部中标识的数据长度实际SKB中UDP数据报的长度，
+	 * 这里是传输层，哪怕IP分片，也要重组后才会到这里。 */
 	if (ulen > skb->len)
 		goto short_packet;
 
@@ -1552,17 +1570,24 @@ int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
 		uh = udp_hdr(skb);
 	}
 
+	/* 初始化UDP的校验和 */
 	if (udp4_csum_init(skb, uh, proto))
 		goto csum_error;
 
+	/* 组播或广播单独处理 */
 	if (rt->rt_flags & (RTCF_BROADCAST|RTCF_MULTICAST))
 		return __udp4_lib_mcast_deliver(net, skb, uh,
 				saddr, daddr, udptable);
 
+	/* 根据源地址、源端口、目的地址和目的端口，在udptable哈希表中查找所属
+	 * 的传输控制块 */
 	sk = __udp4_lib_lookup_skb(skb, uh->source, uh->dest, udptable);
 
 	if (sk != NULL) {
+		/* 如果找到所属传输控制块，则将 UDP 数据报添加到所属传输控制块
+		 * 的接收队列中，并返回操作结果 */
 		int ret = udp_queue_rcv_skb(sk, skb);
+		/* 到此就完成了传输层对该报文的接收处理了，减少sk的引用技术 */
 		sock_put(sk);
 
 		/* a return value > 0 means to resubmit the input, but
@@ -1573,6 +1598,9 @@ int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
 		return 0;
 	}
 
+	/*
+	 * 下面是处理找不到所属传输控制块的数据报。
+	 */
 	if (!xfrm4_policy_check(NULL, XFRM_POLICY_IN, skb))
 		goto drop;
 	nf_reset(skb);
@@ -1581,6 +1609,8 @@ int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
 	if (udp_lib_checksum_complete(skb))
 		goto csum_error;
 
+	/* 通过校验和检测但又找不到所属传输控制块的包，则向发送端发送目的不可
+	 * 达 ICMP 报文 */
 	UDP_INC_STATS_BH(net, UDP_MIB_NOPORTS, proto == IPPROTO_UDPLITE);
 	icmp_send(skb, ICMP_DEST_UNREACH, ICMP_PORT_UNREACH, 0);
 
@@ -1620,6 +1650,9 @@ drop:
 	return 0;
 }
 
+/**
+ * 接收方向，网络层进入UDP传输层的入口函数。
+ */
 int udp_rcv(struct sk_buff *skb)
 {
 	return __udp4_lib_rcv(skb, &udp_table, IPPROTO_UDP);

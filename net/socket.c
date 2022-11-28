@@ -1729,6 +1729,15 @@ SYSCALL_DEFINE3(getpeername, int, fd, struct sockaddr __user *, usockaddr,
  *	the protocol.
  */
 
+/**
+ * sendto	发送UDP报文。
+ * @fd:		socket 对应的文件描述符。
+ * @buff:	待发送的消息内容，内存在用户空间中。
+ * @len:	buff中内容的长度。
+ * @flags:	可选的一些标志位。
+ * @addr:	此报文的接收方的地址信息。
+ * @addr_len:	地址的长度。
+ */
 SYSCALL_DEFINE6(sendto, int, fd, void __user *, buff, size_t, len,
 		unsigned, flags, struct sockaddr __user *, addr,
 		int, addr_len)
@@ -1753,6 +1762,7 @@ SYSCALL_DEFINE6(sendto, int, fd, void __user *, buff, size_t, len,
 	msg.msg_controllen = 0;
 	msg.msg_namelen = 0;
 	if (addr) {
+		/* 地址信息要移动到内核空间 */
 		err = move_addr_to_kernel(addr, addr_len, (struct sockaddr *)&address);
 		if (err < 0)
 			goto out_put;

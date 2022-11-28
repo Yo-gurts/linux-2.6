@@ -279,6 +279,9 @@ static void sock_disable_timestamp(struct sock *sk, int flag)
 }
 
 
+/**
+ * 将数据包 skb 放入传输控制块 sk 的接收队列中。
+ */
 int sock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 {
 	int err;
@@ -289,12 +292,16 @@ int sock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 	/* Cast sk->rcvbuf to unsigned... It's pointless, but reduces
 	   number of warnings when compiling with -W --ANK
 	 */
+	/* 检测当前用于接收的缓存大小是否已达到了接收缓冲区大小的上限。
+	 * 一旦达到，则不能继续接收。
+	 */
 	if (atomic_read(&sk->sk_rmem_alloc) + skb->truesize >=
 	    (unsigned)sk->sk_rcvbuf) {
 		atomic_inc(&sk->sk_drops);
 		return -ENOMEM;
 	}
 
+	/* 如果在传输控制块中安装了过滤器，则只有符合过滤规则的报文才能放行 */
 	err = sk_filter(sk, skb);
 	if (err)
 		return err;
@@ -321,10 +328,12 @@ int sock_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
 
 	spin_lock_irqsave(&list->lock, flags);
 	skb->dropcount = atomic_read(&sk->sk_drops);
+	/* 此处完成将数据包放入到接收队列 */
 	__skb_queue_tail(list, skb);
 	spin_unlock_irqrestore(&list->lock, flags);
 
 	if (!sock_flag(sk, SOCK_DEAD))
+		/* 如果套接口未关闭，则唤醒等待该套接口的接收进程 */
 		sk->sk_data_ready(sk, skb_len);
 	return 0;
 }
@@ -1015,6 +1024,7 @@ static struct sock *sk_prot_alloc(struct proto *prot, gfp_t priority,
 	struct sock *sk;
 	struct kmem_cache *slab;
 
+	/* 根据slab是否有效，选择从slab还是通过kmalloc分配内存 */
 	slab = prot->slab;
 	if (slab != NULL) {
 		sk = kmem_cache_alloc(slab, priority & ~__GFP_ZERO);
@@ -1092,6 +1102,7 @@ EXPORT_SYMBOL(sock_update_classid);
  *	@family: protocol family
  *	@priority: for allocation (%GFP_KERNEL, %GFP_ATOMIC, etc)
  *	@prot: struct proto associated with this new sock instance
+ *	分配一个传输控制快，在创建套接口时调用。分配的方式与协议族有关。
  */
 struct sock *sk_alloc(struct net *net, int family, gfp_t priority,
 		      struct proto *prot)
