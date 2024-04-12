@@ -6000,12 +6000,21 @@ static struct pernet_operations __net_initdata default_device_ops = {
  *       This is called single threaded during boot, so no need
  *       to take the rtnl semaphore.
  */
+
+/**
+ * 在系统启动时，net_dev_init() 的初始化优先级是 subsys_initcall，用来初始化相关
+ * 接口层，如，注册记录相关统计信息的 proc 文件，初始化每个 CPU 的 softnet_data，
+ * 注册网络报文输入/输出软中断以及处理例程，注册响应 CPU 状态变化的回调函数等。
+ */
 static int __init net_dev_init(void)
 {
 	int i, rc = -ENOMEM;
 
 	BUG_ON(!dev_boot_phase);
 
+	/* 注册接口层用于显示网络设备收发数据包统计信息的/proc/net/dev文件，以
+	 * 及用于显示每个CPU的softnet_stat统计信息的/proc/net/softnet_stat 文件
+	 */
 	if (dev_proc_init())
 		goto out;
 
